@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Shared settings for RSVP batch on the management EC2 (was infra-son01).
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config_eks-automode}"
+export AWS_REGION="${AWS_REGION:-ap-northeast-2}"
+export NAMESPACE="${NAMESPACE:-l2comm-batch}"
+export POD_MOUNT_PATH="${POD_MOUNT_PATH:-/home/jupyter}"
+# setup-efs.sh syncs <repository>/mnt into the EFS root.
+# The Pod mounts this subpath, same contract as the GCP NFSv4 export.
+export EFS_PATH="${EFS_PATH:-/batch_eks/l2/rsvp}"
+export EFS_NAME="${EFS_NAME:-efs-l2comm-rsvp}"
+export EFS_ID="${EFS_ID:-}"          # empty -> resolved from EFS_NAME at runtime
+export PV_NAME="${PV_NAME:-l2comm-rsvp-pv}"
+export PVC_NAME="${PVC_NAME:-l2comm-rsvp-pvc}"
+# Path contract is kept from GCP. The file content is an AWS shared
+# credentials (INI) file instead of a GCP service account JSON key.
+export SA_KEY_PATH="${SA_KEY_PATH:-/home/jupyter/.oefj}"
+export SA_KEY_PROFILE="${SA_KEY_PROFILE:-l2comm}"
+export ATHENA_WORKGROUP="${ATHENA_WORKGROUP:-wg-l2comm}"
+export TARGET_DATABASE="${TARGET_DATABASE:-dlk_sample}"

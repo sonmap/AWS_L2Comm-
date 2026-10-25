@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# AWS_L2Comm - EKS Auto Mode common client
+# - Uses the private EKS kubeconfig on the management EC2
+# - Creates/reuses a static EFS CSI PV/PVC
+# - Creates a batch Pod and mounts the Git-managed EFS share read-only
+#
+# GCP 원본(ssw/dlk/client_gke)과의 차이
+#   nfs: {server, path}        -> csi: {driver: efs.csi.aws.com, volumeHandle: fs-xxx:/subpath}
+#   mountOptions: vers=4.1     -> volumeAttributes: encryptInTransit=true
+#   NFS_SERVER (VM 사설 IP)    -> EFS_ID (파일 시스템 ID)
+#   GOOGLE_APPLICATION_CREDENTIALS -> AWS_SHARED_CREDENTIALS_FILE + AWS_PROFILE
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/client_common"
+
+PROGRAM_ID=""
+DOCKER_IMAGE=""
+GPU="0"
+CPU="1"
+MEM_GB="4"
+SHELL_COMMAND=""
+NAMESPACE="${NAMESPACE:-l2comm-batch}"
+KSA_NAME="${KSA_NAME:-ksa-l2comm-batch}"
+
+EFS_PATH="${EFS_PATH:-/batch_eks/l2/rsvp}"
+PV_NAME="${PV_NAME:-l2comm-rsvp-pv}"
+PVC_NAME="${PVC_NAME:-l2comm-rsvp-pvc}"
+POD_MOUNT_PATH="${POD_MOUNT_PATH:-/home/jupyter}"
+PV_SIZE="${PV_SIZE:-20Gi}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  client_eks \
+    --program-id PROGRAM_ID \
+    --docker-image IMAGE_URI \
+    --gpu 0 \
+    --cpu 4 \
+    --mem-gb 16 \
+    --shell-command "cd /home/jupyter/GP_L2RSVP_001_1/python && python athena_auth_smoke.py" \
+    [--namespace l2comm-batch] \
+    [--efs-id fs-0123456789abcdef0] \
+    [--efs-path /batch_eks/l2/rsvp]
+
+Environment:
+  KUBECONFIG     default: $HOME/.kube/config_eks-automode
+  DRY_RUN=1      create/print manifests only; do not kubectl apply
+  EFS_ID         default: resolved from EFS_NAME (efs-l2comm-rsvp)
+  PV_NAME        default: l2comm-rsvp-pv
+  PVC_NAME       default: l2comm-rsvp-pvc
+  POD_MOUNT_PATH default: /home/jupyter
+  PV_SIZE        default: 20Gi
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --program-id) PROGRAM_ID="$2"; shift 2 ;;
+    --docker-image) DOCKER_IMAGE="$2"; shift 2 ;;
+    --gpu) GPU="$2"; shift 2 ;;
+    --cpu) CPU="$2"; shift 2 ;;
+    --mem-gb) MEM_GB="$2"; shift 2 ;;
+    --shell-command) SHELL_COMMAND="$2"; shift 2 ;;
+    --namespace) NAMESPACE="$2"; shift 2 ;;
+    --efs-id) EFS_ID="$2"; shift 2 ;;
+    --efs-path) EFS_PATH="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+[[ -n "$PROGRAM_ID" ]] || { echo "ERROR: --program-id is required" >&2; exit 1; }
+[[ -n "$DOCKER_IMAGE" ]] || { echo "ERROR: --docker-image is required" >&2; exit 1; }
+[[ -n "$SHELL_COMMAND" ]] || { echo "ERROR: --shell-command is required" >&2; exit 1; }
+
+# By default the EFS file system is looked up by its Name tag.
+if [[ -z "${EFS_ID}" ]]; then
+  EFS_ID="$(aws efs describe-file-systems --region "${AWS_REGION}" \
+    --query "FileSystems[?Name=='${EFS_NAME}'].FileSystemId | [0]" \
+    --output text 2>/dev/null || true)"
+fi
+if [[ -z "${EFS_ID}" || "${EFS_ID}" == "None" ]]; then
+  echo "ERROR: EFS file system could not be resolved. Use --efs-id." >&2
+  exit 1
+fi
+
+POD_BASE="$(echo "$PROGRAM_ID" | tr '[:upper:]' '[:lower:]' | tr '_. ' '---' | tr -cd 'a-z0-9-')"
+POD_BASE="${POD_BASE:0:40}"
+POD_NAME="${POD_BASE}-$(date +%Y%m%d%H%M%S)"
+TMP_DIR="/tmp/${POD_NAME}"
+PV_YAML="${TMP_DIR}/pv.yaml"
+PVC_YAML="${TMP_DIR}/pvc.yaml"
+POD_YAML="${TMP_DIR}/pod.yaml"
+mkdir -p "$TMP_DIR"
+
+cat > "$PV_YAML" <<YAML
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${PV_NAME}
+spec:
+  capacity:
+    storage: ${PV_SIZE}
+  volumeMode: Filesystem
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    - ro
+  csi:
+    driver: efs.csi.aws.com
+    volumeHandle: ${EFS_ID}:${EFS_PATH}
+    volumeAttributes:
+      encryptInTransit: "true"
+YAML
+
+cat > "$PVC_YAML" <<YAML
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${PVC_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: ""
+  volumeName: ${PV_NAME}
+  resources:
+    requests:
+      storage: ${PV_SIZE}
+YAML
+
+cat > "$POD_YAML" <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${POD_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: l2comm-batch
+    program-id: ${POD_BASE}
+spec:
+  restartPolicy: Never
+  serviceAccountName: ${KSA_NAME}
+  containers:
+    - name: batch
+      image: ${DOCKER_IMAGE}
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+          test -r "\$SA_KEY_PATH" || { echo "Missing or unreadable credential file: \$SA_KEY_PATH"; exit 2; }
+          ${SHELL_COMMAND}
+      env:
+        - name: SA_KEY_PATH
+          value: "${SA_KEY_PATH}"
+        - name: AWS_SHARED_CREDENTIALS_FILE
+          value: "${SA_KEY_PATH}"
+        - name: AWS_PROFILE
+          value: "${SA_KEY_PROFILE}"
+        - name: SA_KEY_PROFILE
+          value: "${SA_KEY_PROFILE}"
+        - name: AWS_DEFAULT_REGION
+          value: "${AWS_REGION}"
+        - name: ATHENA_WORKGROUP
+          value: "${ATHENA_WORKGROUP}"
+        - name: TARGET_DATABASE
+          value: "${TARGET_DATABASE}"
+      resources:
+        requests:
+          cpu: "${CPU}"
+          memory: "${MEM_GB}Gi"
+        limits:
+          cpu: "${CPU}"
+          memory: "${MEM_GB}Gi"
+      volumeMounts:
+        - name: git-efs
+          mountPath: ${POD_MOUNT_PATH}
+          readOnly: true
+  volumes:
+    - name: git-efs
+      persistentVolumeClaim:
+        claimName: ${PVC_NAME}
+        readOnly: true
+YAML
+
+if [[ "$GPU" != "0" ]]; then
+  python3 -I - "$POD_YAML" "$GPU" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+gpu = sys.argv[2]
+text = path.read_text()
+needle = '''        limits:
+          cpu: "'''
+replacement = '''        limits:
+          nvidia.com/gpu: "''' + gpu + '''"
+          cpu: "'''
+if needle not in text:
+    raise SystemExit("GPU insertion point not found")
+path.write_text(text.replace(needle, replacement, 1))
+PY
+fi
+
+echo "============================================================"
+echo "AWS_L2Comm EKS batch"
+echo "============================================================"
+echo "KUBECONFIG    : $KUBECONFIG"
+echo "NAMESPACE     : $NAMESPACE"
+echo "PROGRAM_ID    : $PROGRAM_ID"
+echo "POD_NAME      : $POD_NAME"
+echo "IMAGE         : $DOCKER_IMAGE"
+echo "CPU/MEM/GPU   : $CPU / ${MEM_GB}Gi / $GPU"
+echo "EFS_ID        : $EFS_ID"
+echo "EFS_PATH      : $EFS_PATH"
+echo "PV/PVC        : $PV_NAME / $PVC_NAME"
+echo "POD_MOUNT     : $POD_MOUNT_PATH"
+echo "COMMAND       : $SHELL_COMMAND"
+echo "MANIFEST_DIR  : $TMP_DIR"
+echo "============================================================"
+
+if [[ "${DRY_RUN:-1}" == "1" ]]; then
+  echo
+  echo "[DRY_RUN] pv.yaml"
+  cat "$PV_YAML"
+  echo
+  echo "[DRY_RUN] pvc.yaml"
+  cat "$PVC_YAML"
+  echo
+  echo "[DRY_RUN] pod.yaml"
+  cat "$POD_YAML"
+  exit 0
+fi
+
+kubectl get namespace "$NAMESPACE" >/dev/null 2>&1 || kubectl create namespace "$NAMESPACE"
+
+kubectl -n "$NAMESPACE" get serviceaccount "$KSA_NAME" >/dev/null 2>&1 || \
+  kubectl -n "$NAMESPACE" create serviceaccount "$KSA_NAME"
+
+# Application authentication uses the mounted .oefj credential file explicitly.
+# EKS Pod Identity is configured on this service account but not relied upon here.
+
+kubectl apply -f "$PV_YAML"
+kubectl apply -f "$PVC_YAML"
+
+echo "[INFO] PVC status"
+kubectl -n "$NAMESPACE" get pvc "$PVC_NAME" -o wide
+
+kubectl apply -f "$POD_YAML"
+
+echo "[INFO] Waiting for Pod completion: $POD_NAME"
+set +e
+kubectl wait -n "$NAMESPACE" \
+  --for=jsonpath='{.status.phase}'=Succeeded \
+  "pod/$POD_NAME" \
+  --timeout=3600s
+WAIT_RC=$?
+set -e
+
+echo
+echo "================ POD LOG ================"
+kubectl -n "$NAMESPACE" logs "$POD_NAME" || true
+echo "========================================="
+
+if [[ $WAIT_RC -ne 0 ]]; then
+  echo "[ERROR] Pod did not reach Succeeded."
+  kubectl -n "$NAMESPACE" get pod "$POD_NAME" -o wide || true
+  kubectl -n "$NAMESPACE" describe pod "$POD_NAME" || true
+  exit "$WAIT_RC"
+fi
+
+kubectl -n "$NAMESPACE" delete pod "$POD_NAME" --ignore-not-found=true
+rm -rf "$TMP_DIR"
+
+echo "[SUCCESS] $PROGRAM_ID"

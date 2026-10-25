@@ -1,0 +1,71 @@
+# AWS_L2Comm 디버그 Pod
+#
+# 배치 Pod 은 1분 안에 끝나고 삭제되므로 접속할 수 없습니다.
+# 이 Pod 는 배치와 동일한 환경(이미지 / KSA / EFS 마운트 / 환경변수)으로
+# 떠서 대기하므로 kubectl exec 로 들어가 확인할 수 있습니다.
+#
+# 적용:
+#   kubectl apply -f k8s/debug-pod.yaml
+#   kubectl -n l2comm-batch wait --for=condition=Ready pod/l2comm-debug --timeout=300s
+#   kubectl -n l2comm-batch exec -it l2comm-debug -- bash
+#
+# 정리:
+#   kubectl delete -f k8s/debug-pod.yaml
+#
+# 참고용 매니페스트입니다. RSVP 표준 실행은 docs/RUNBOOK.md §10~11을 따릅니다.
+# image 와 PVC 는 실제 환경 값으로 바꿔야 합니다.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: l2comm-debug
+  namespace: l2comm-batch
+  labels:
+    app: l2comm-debug
+spec:
+  restartPolicy: Never
+  serviceAccountName: ksa-l2comm-batch
+
+  # 방치되어도 과금이 늘지 않도록 2시간 뒤 스스로 종료합니다.
+  activeDeadlineSeconds: 7200
+
+  containers:
+    - name: debug
+      # <ECR_ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/... 으로 바꾸십시오.
+      image: 444455556666.dkr.ecr.ap-northeast-2.amazonaws.com/ar-l2comm-python/python-athena-batch:v1
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c", "sleep 7200"]
+
+      env:
+        - name: AWS_DEFAULT_REGION
+          value: "ap-northeast-2"
+        - name: SA_KEY_PATH
+          value: "/home/jupyter/.oefj"
+        - name: AWS_SHARED_CREDENTIALS_FILE
+          value: "/home/jupyter/.oefj"
+        - name: AWS_PROFILE
+          value: "l2comm"
+        - name: TARGET_DATABASE
+          value: "dlk_sample"
+        - name: TARGET_TABLE
+          value: "aws_region_inventory"
+        - name: ATHENA_WORKGROUP
+          value: "wg-l2comm"
+
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "1Gi"
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+
+      volumeMounts:
+        - name: git-efs
+          mountPath: /home/jupyter
+          readOnly: true
+
+  volumes:
+    - name: git-efs
+      persistentVolumeClaim:
+        claimName: l2comm-rsvp-pvc
+        readOnly: true

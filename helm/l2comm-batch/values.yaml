@@ -1,0 +1,13 @@
+# EKS Pod Identity 를 쓰므로 ServiceAccount 에 IAM 어노테이션이 필요 없습니다.
+# (GCP 의 iam.gke.io/gcp-service-account 어노테이션 대응물이 없습니다.)
+# 연결은 aws eks create-pod-identity-association 으로 합니다 - 30-platform.sh 참고.
+serviceAccount:
+  create: true
+  name: ksa-l2comm-batch
+  # 참고용. Pod Identity 연결 대상 역할 ARN.
+  iamRoleArn: arn:aws:iam::111122223333:role/role-l2comm-eks
+
+image:
+  repository: 444455556666.dkr.ecr.ap-northeast-2.amazonaws.com/ar-l2comm-python/python-athena-batch
+  tag: v1
+  pullPolicy: IfNotPresent

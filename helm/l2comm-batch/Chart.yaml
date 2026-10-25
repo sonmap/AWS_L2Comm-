@@ -1,0 +1,6 @@
+apiVersion: v2
+name: l2comm-batch
+version: 0.1.0
+appVersion: "1.0"
+description: L2Comm private EKS bootstrap chart for NAT-less environments
+type: application

@@ -1,0 +1,36 @@
+# cloudbuild/cloudbuild.yaml 의 AWS CodeBuild 등가 구현
+#
+# GCP                                  AWS
+# ---------------------------------    -------------------------------------
+# substitutions._IMAGE_URI             환경변수 IMAGE_URI (30-platform.sh 가 주입)
+# gcr.io/cloud-builders/docker         CodeBuild 표준 이미지 + privilegedMode
+# images: [...]  (암묵적 push)         명시적 docker push
+# serviceAccount: sa-l2comm-gke        프로젝트 serviceRole: role-l2comm-codebuild
+# options.logging CLOUD_LOGGING_ONLY   CodeBuild 기본 CloudWatch Logs
+#
+# IMAGE_URI / ECR_REGISTRY 는 CodeBuild 프로젝트 환경변수로 들어옵니다.
+# 로컬에서 수동 빌드하려면 두 값을 직접 지정하십시오.
+
+version: 0.2
+
+env:
+  variables:
+    DOCKER_BUILDKIT: "1"
+
+phases:
+  pre_build:
+    commands:
+      - echo "IMAGE_URI   = ${IMAGE_URI}"
+      - echo "ECR_REGISTRY= ${ECR_REGISTRY}"
+      - test -n "${IMAGE_URI}" || { echo "IMAGE_URI is empty"; exit 1; }
+      - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}"
+        | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+  build:
+    commands:
+      - docker build -t "${IMAGE_URI}" app
+
+  post_build:
+    commands:
+      - docker push "${IMAGE_URI}"
+      - echo "Pushed ${IMAGE_URI}"
